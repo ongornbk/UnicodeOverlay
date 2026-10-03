@@ -11,7 +11,8 @@ public:
     bool Initialize(HWND hwnd);
     bool Resize();
 
-    void Render(const CharacterDatabase& db, size_t selected, UINT dpi);
+    // Render now takes the already-filtered rows and the active query string.
+    void Render(const std::vector<Entry>& rows, size_t selected, UINT dpi, const std::wstring& query);
 
     void Shutdown();
 

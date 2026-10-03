@@ -146,7 +146,7 @@ bool D3D12OverlayRenderer::Resize()
     return true;
 }
 
-void D3D12OverlayRenderer::Render(const CharacterDatabase& db, size_t selected, UINT dpi)
+void D3D12OverlayRenderer::Render(const std::vector<Entry>& rows, size_t selected, UINT dpi, const std::wstring& query)
 {
     if (!m_ready) return;
     WaitGpu();
@@ -214,12 +214,17 @@ void D3D12OverlayRenderer::Render(const CharacterDatabase& db, size_t selected, 
         D2D1::RoundedRect(D2D1::RectF(0, 0, size.width, size.height),
             12.0f * dpi / 96.0f, 12.0f * dpi / 96.0f), bg.Get());
 
-    const std::wstring title = L"Unicode symbols  •  1–9 select  •  Enter commit  •  Esc cancel";
+    const std::wstring title = L"Unicode symbols  •  Type to search  •  Enter commit  •  Esc cancel";
     m_d2dContext->DrawText(title.c_str(), static_cast<UINT32>(title.size()),
         m_textFormat.Get(),
         D2D1::RectF(pad, pad, size.width - pad, top), fg.Get());
 
-    const auto& rows = db.Sorted();
+    // Draw search query under the title.
+    const std::wstring qline = L"Search: " + query;
+    m_d2dContext->DrawText(qline.c_str(), static_cast<UINT32>(qline.size()),
+        m_textFormat.Get(),
+        D2D1::RectF(pad, pad + 20.0f * dpi / 96.0f, size.width - pad, top), fg.Get());
+
     const size_t n = std::min<size_t>(9, rows.size());
     for (size_t i = 0; i < n; ++i) {
         float y = top + i * rowH;
@@ -228,9 +233,9 @@ void D3D12OverlayRenderer::Render(const CharacterDatabase& db, size_t selected, 
                 D2D1::RoundedRect(D2D1::RectF(pad - 5, y + 2, size.width - pad + 5, y + rowH - 3),
                     6, 6), accent.Get());
 
-        std::wstring line = std::to_wstring(i + 1) + L"   " + rows[i].text +
-            L"      " + rows[i].code + L"      " +
-            std::to_wstring(rows[i].uses);
+        // No 1-9 numbering; show glyph, name and code
+        std::wstring line = rows[i].text + L"   " + rows[i].code +
+            L"      " + rows[i].text + L"      " + std::to_wstring(rows[i].uses);
         auto brush = (i == selected) ? bg.Get() : fg.Get();
         m_d2dContext->DrawText(line.c_str(), static_cast<UINT32>(line.size()),
             m_textFormat.Get(),

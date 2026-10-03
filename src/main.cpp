@@ -103,6 +103,7 @@ public:
         if (m_active) return;
         m_active = true;
         m_selected = 0;
+        m_query.clear();
         m_previousForeground = GetForegroundWindow();
 
         POINT pt{};
@@ -136,10 +137,13 @@ public:
         m_previousForeground = nullptr;
 
         bool ok = true;
-        if (commit && m_selected < std::min<size_t>(9, m_db.Sorted().size())) {
-            const auto text = m_db.Sorted()[m_selected].text;
+
+        // obtain filtered rows at time of commit
+        const auto rows = m_db.Filtered(m_query);
+        if (commit && m_selected < rows.size()) {
+            const auto text = rows[m_selected].text;
             ok = UnicodeInjector::Insert(text);
-            if (ok) m_db.Use(m_selected);
+            if (ok) m_db.UseByCode(rows[m_selected].code);
         }
 
         ShowWindow(m_hwnd, SW_HIDE);
@@ -153,17 +157,43 @@ public:
         // If injection failed, briefly expose a diagnostic in the window title.
         // It does not create a message box or steal focus.
         if (!ok) SetWindowTextW(m_hwnd, L"Unicode Overlay - SendInput blocked");
-        else SetWindowTextW(m_hwnd, L"Unicode Overlay");
+        else SetWindowTextW(m_hwnd, L"Unicode Overlay");    
     }
 
     void Key(UINT vk, bool down, bool repeat) {
         if (!m_active || !down || repeat) return;
-        const auto count = std::min<size_t>(9, m_db.Sorted().size());
-        if (vk >= '1' && vk <= '9') {
-            const size_t i = vk - '1';
-            if (i < count) { m_selected = i; Render(); }
+
+        // Printable characters (simple ASCII support), space and backspace and minus.
+        if (vk == VK_BACK) {
+            if (!m_query.empty()) {
+                m_query.pop_back();
+                m_selected = 0;
+                Render(); 
+            }
             return;
         }
+        if (vk == VK_SPACE) {
+            m_query.push_back(L' ');
+            m_selected = 0;
+            Render(); return;
+        }
+        if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+            // Append ASCII char; filter is case-insensitive.
+            wchar_t ch = static_cast<wchar_t>(vk);
+            m_query.push_back(ch);
+            m_selected = 0;
+            Render(); return;
+        }
+        if (vk == VK_OEM_MINUS) {
+            m_query.push_back(L'-');
+            m_selected = 0;
+            Render(); return;
+        }
+
+        // Navigation & commit:
+        const auto rows = m_db.Filtered(m_query);
+        const auto count = rows.size();
+
         if (vk == VK_UP) {
             if (count) m_selected = (m_selected + count - 1) % count;
             Render(); return;
@@ -203,7 +233,9 @@ public:
         // Set the new size
         SetWindowPos(m_hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOACTIVATE);
 
-        m_renderer.Render(m_db, m_selected, GetDpiForWindow(m_hwnd));
+        const auto rows = m_db.Filtered(m_query);
+        if (m_selected >= rows.size() && !rows.empty()) m_selected = rows.size() - 1;
+        m_renderer.Render(rows, m_selected, GetDpiForWindow(m_hwnd), m_query);
     }
 
     HWND Window() const noexcept { return m_hwnd; }
@@ -245,6 +277,7 @@ private:
     HWND m_previousForeground{};
     bool m_active{};
     size_t m_selected{};
+    std::wstring m_query; // new: current search query
     CharacterDatabase m_db;
     D3D12OverlayRenderer m_renderer;
     std::unique_ptr<KeyboardManager> m_keyboard;
