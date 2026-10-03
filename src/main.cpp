@@ -42,7 +42,7 @@ private:
     std::thread m_thread;
     std::atomic<bool> m_active{false};
     std::atomic<bool> m_stop{false};
-    DWORD m_threadId{};
+    std::atomic<DWORD> m_threadId{0}; // made atomic to avoid data-race between threads
     HHOOK m_hook{};
     // Changed default activation from left Alt to VK_RETURN (num-pad Enter).
     // The num-pad Enter reports VK_RETURN with the extended flag set; the hook
@@ -89,10 +89,13 @@ public:
         return static_cast<int>(msg.wParam);
     }
 
-    void Shutdown() {
-        if (m_keyboard) m_keyboard->Stop();
+    void Shutdown()
+    {
+        if (m_keyboard)
+            m_keyboard->Stop();
         m_renderer.Shutdown();
-        if (m_hwnd) DestroyWindow(m_hwnd);
+        if (m_hwnd)
+            DestroyWindow(m_hwnd);
         m_hwnd = nullptr;
     }
 
@@ -181,6 +184,25 @@ public:
 
     void Render() {
         if (!m_active) return;
+
+        // Calculate the new position and size for the overlay window.
+        RECT rect;
+        GetWindowRect(m_hwnd, &rect);
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+
+        // Maintain a 16:9 aspect ratio
+        if (width * 9 > height * 16) {
+            // Too wide, adjust width
+            width = height * 16 / 9;
+        } else {
+            // Too tall or just right, adjust height
+            height = width * 9 / 16;
+        }
+
+        // Set the new size
+        SetWindowPos(m_hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOACTIVATE);
+
         m_renderer.Render(m_db, m_selected, GetDpiForWindow(m_hwnd));
     }
 
@@ -295,27 +317,29 @@ bool KeyboardManager::Start()
     m_thread = std::thread(&KeyboardManager::ThreadMain, this);
 
     // Wait briefly for the hook thread to publish its ID.
-    for (int i=0; i<100 && m_threadId==0; ++i) Sleep(1);
-    return m_threadId != 0;
+    for (int i=0; i<100 && m_threadId.load(std::memory_order_acquire)==0; ++i) Sleep(1);
+    return m_threadId.load(std::memory_order_acquire) != 0;
 }
 
 void KeyboardManager::Stop()
 {
     m_stop.store(true, std::memory_order_release);
-    if (m_threadId) PostThreadMessageW(m_threadId, WM_QUIT, 0, 0);
+    const DWORD threadId = m_threadId.load(std::memory_order_acquire);
+    if (threadId) PostThreadMessageW(threadId, WM_QUIT, 0, 0);
     if (m_thread.joinable()) m_thread.join();
-    m_threadId = 0;
+    m_threadId.store(0, std::memory_order_release);
 }
 
 void KeyboardManager::ThreadMain()
 {
 	g_keyboardManager = this;
-	m_threadId = GetCurrentThreadId();
+	m_threadId.store(GetCurrentThreadId(), std::memory_order_release);
 
 	m_hook = SetWindowsHookExW(WH_KEYBOARD_LL, HookProc, nullptr, 0);
 	if (!m_hook)
     {
 		g_keyboardManager = nullptr;
+		m_threadId.store(0, std::memory_order_release);
 		return;
 	}
 
@@ -330,6 +354,7 @@ void KeyboardManager::ThreadMain()
 	UnhookWindowsHookEx(m_hook);
 	m_hook = nullptr;
 	g_keyboardManager = nullptr;
+	m_threadId.store(0, std::memory_order_release);
 }
 
 }

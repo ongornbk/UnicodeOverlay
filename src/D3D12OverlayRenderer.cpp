@@ -65,9 +65,14 @@ bool D3D12OverlayRenderer::Initialize(HWND hwnd)
     // D3D11On12 lets Direct2D/DirectWrite render text using the D3D12
     // backbuffers. All APIs are Windows SDK APIs; no third-party renderer.
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+
+    // IMPORTANT: provide the D3D12 command queue to D3D11On12. Omitting the
+    // queue (passing nullptr/0) can produce unstable behavior (device removal)
+    // — especially in Release builds. Provide the queue as an IUnknown* array.
+    IUnknown* queues[] = { m_queue.Get() };
     if (FAILED(D3D11On12CreateDevice(
         m_device.Get(), D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        levels, ARRAYSIZE(levels), nullptr, 0, 0,
+        levels, ARRAYSIZE(levels), reinterpret_cast<IUnknown**>(queues), 1, 0,
         &m_d3d11, &m_d3d11Context, nullptr)))
         return false;
     if (FAILED(m_d3d11.As(&m_on12))) return false;
