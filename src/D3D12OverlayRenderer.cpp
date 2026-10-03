@@ -209,7 +209,16 @@ void D3D12OverlayRenderer::Render(const std::vector<Entry>& rows, size_t selecte
 
     const float pad = 18.0f * dpi / 96.0f;
     const float rowH = 38.0f * dpi / 96.0f;
-    const float top = pad + rowH;
+
+    // Reserve distinct vertical space for title and search query to avoid overlap.
+    const float titleH = 20.0f * dpi / 96.0f;
+    const float queryH = 24.0f * dpi / 96.0f;
+    const float titleTop = pad;
+    const float titleBottom = titleTop + titleH;
+    const float queryTop = titleBottom;
+    const float queryBottom = queryTop + queryH;
+    const float top = queryBottom + 6.0f * dpi / 96.0f; // small gap before rows
+
     m_d2dContext->FillRoundedRectangle(
         D2D1::RoundedRect(D2D1::RectF(0, 0, size.width, size.height),
             12.0f * dpi / 96.0f, 12.0f * dpi / 96.0f), bg.Get());
@@ -217,13 +226,13 @@ void D3D12OverlayRenderer::Render(const std::vector<Entry>& rows, size_t selecte
     const std::wstring title = L"Unicode symbols  •  Type to search  •  Enter commit  •  Esc cancel";
     m_d2dContext->DrawText(title.c_str(), static_cast<UINT32>(title.size()),
         m_textFormat.Get(),
-        D2D1::RectF(pad, pad, size.width - pad, top), fg.Get());
+        D2D1::RectF(pad, titleTop, size.width - pad, titleBottom), fg.Get());
 
-    // Draw search query under the title.
+    // Draw search query on its own line below the title.
     const std::wstring qline = L"Search: " + query;
     m_d2dContext->DrawText(qline.c_str(), static_cast<UINT32>(qline.size()),
         m_textFormat.Get(),
-        D2D1::RectF(pad, pad + 20.0f * dpi / 96.0f, size.width - pad, top), fg.Get());
+        D2D1::RectF(pad, queryTop, size.width - pad, queryBottom), fg.Get());
 
     const size_t n = std::min<size_t>(9, rows.size());
     for (size_t i = 0; i < n; ++i) {
@@ -233,7 +242,7 @@ void D3D12OverlayRenderer::Render(const std::vector<Entry>& rows, size_t selecte
                 D2D1::RoundedRect(D2D1::RectF(pad - 5, y + 2, size.width - pad + 5, y + rowH - 3),
                     6, 6), accent.Get());
 
-        // No 1-9 numbering; show glyph, name and code
+        // Show glyph, name and uses
         std::wstring line = rows[i].text + L"   " + rows[i].code +
             L"      " + rows[i].text + L"      " + std::to_wstring(rows[i].uses);
         auto brush = (i == selected) ? bg.Get() : fg.Get();
