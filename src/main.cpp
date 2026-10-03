@@ -422,7 +422,10 @@ private:
     std::atomic<bool> m_stop{false};
     DWORD m_threadId{};
     HHOOK m_hook{};
-    UINT m_activationVk{VK_LMENU};
+    // Changed default activation from left Alt to VK_RETURN (num-pad Enter).
+    // The num-pad Enter reports VK_RETURN with the extended flag set; the hook
+    // checks for that to distinguish it from the main Enter key.
+    UINT m_activationVk{VK_RETURN};
     bool m_activationDown{};
 };
 
@@ -616,7 +619,14 @@ LRESULT CALLBACK KeyboardManager::HookProc(int code, WPARAM wp, LPARAM lp) {
     if (!down && !up) return CallNextHookEx(nullptr, code, wp, lp);
 
     const UINT vk = static_cast<UINT>(k->vkCode);
-    const bool isActivation = (vk == self->m_activationVk);
+
+    // Detect activation key == num-pad Enter:
+    bool isActivation = (vk == self->m_activationVk);
+    if (isActivation && vk == VK_RETURN) {
+        // num-pad Enter reports VK_RETURN with the extended flag set (0x01).
+        // Require the extended flag so main Enter doesn't act as the special key.
+        isActivation = (k->flags & LLKHF_EXTENDED) != 0;
+    }
 
     if (isActivation) {
         if (down && !self->m_activationDown) {
@@ -627,10 +637,9 @@ LRESULT CALLBACK KeyboardManager::HookProc(int code, WPARAM wp, LPARAM lp) {
             return 1; // swallow activation key-down
         }
         if (up) {
+            // Do not commit/close the overlay on activation key release.
+            // Keep the overlay active until the user presses Enter or Esc.
             self->m_activationDown = false;
-            self->m_active.store(false, std::memory_order_release);
-            PostMessageW(self->m_app.Window(),
-                               WMU_DEACTIVATE, 1, 0);
             return 1; // swallow activation key-up
         }
         return 1; // swallow auto-repeat of activation
