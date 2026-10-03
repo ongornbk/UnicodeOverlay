@@ -250,3 +250,26 @@ void D3D12OverlayRenderer::WaitGpu()
         WaitForSingleObject(m_fenceEvent, INFINITE);
     }
 }
+
+void D3D12OverlayRenderer::Shutdown()
+{
+    if (!m_ready && !m_device) return;
+    WaitGpu();
+    m_d2dTarget.Reset();
+    for (auto& r : m_wrapped) r.Reset();
+    m_textFormat.Reset();
+    m_writeFactory.Reset();
+    m_d2dContext.Reset();
+    m_d2dDevice.Reset();
+    m_d2dFactory.Reset();
+    m_on12.Reset();
+    m_d3d11Context.Reset();
+    m_d3d11.Reset();
+    m_fence.Reset();
+    m_swapChain.Reset();
+    m_queue.Reset();
+    m_device.Reset();
+    m_factory.Reset();
+    if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
+    m_ready = false;
+}

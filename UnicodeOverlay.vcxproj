@@ -92,6 +92,7 @@
     <ClInclude Include="src\CharacterDatabase.h" />
     <ClInclude Include="src\D3D12OverlayRenderer.h" />
     <ClInclude Include="src\SharedHeader.h" />
+    <ClInclude Include="src\UnicodeInjector.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
