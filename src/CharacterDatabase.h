@@ -2,6 +2,28 @@
 #include "SharedHeader.h"
 #include <algorithm>
 #include <cwctype>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <optional>
+#include <memory>
+#include <sstream>
+#include <sqlite3.h>
+
+// Character database backed by SQLite with multikey support.
+//
+// Key points:
+// - Persistent DB file via sqlite3_open16(L"characters.db", ...).
+// - Schema executed statement-by-statement, foreign keys enabled.
+// - `entries.id` is INTEGER PRIMARY KEY (no AUTOINCREMENT).
+// - `keys.key` is UNIQUE to ensure each lookup key maps to exactly one entry.
+// - All SQLite UTF-16 API functions are used so std::wstring is passed/returned directly.
+// - Get(key) performs an atomic UPDATE ... RETURNING that increments uses and returns the
+//   previous uses value (uses before increment).
+// - All prepared statements are finalized via RAII (std::unique_ptr with sqlite3_finalize).
+// - Seed() will not duplicate entries: it checks for an existing entry with the same
+//   code+text before inserting. Keys are inserted with INSERT OR IGNORE to avoid conflicts
+//   on re-seed.
 
 struct Entry
 {
@@ -12,20 +34,179 @@ struct Entry
 
 class CharacterDatabase
 {
-    std::vector<Entry> m_entries;
+    sqlite3* db_{ nullptr };
 
-    static std::wstring ToLower(std::wstring s)
+    using StmtPtr = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
+
+    // Prepare a single SQL statement (UTF-16). Throws runtime_error on failure.
+    StmtPtr PrepareStmt(const std::wstring& sql) const
     {
-        std::transform(s.begin(), s.end(), s.begin(),
-            [](wchar_t c) { return std::towlower(c); });
-        return s;
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare16_v2(db_, sql.c_str(), -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            std::ostringstream oss;
+            const char* err = sqlite3_errmsg(db_);
+            oss << "sqlite3_prepare16_v2 failed: " << (err ? err : "(null)");
+            if (stmt) sqlite3_finalize(stmt);
+            throw std::runtime_error(oss.str());
+        }
+        return StmtPtr(stmt, &sqlite3_finalize);
+    }
+
+    // Execute a statement that does not return rows (BEGIN, COMMIT, CREATE, PRAGMA, etc).
+    // Accepts SQLITE_DONE or SQLITE_ROW as a step result (some PRAGMAs return rows).
+    void ExecSimple(const std::wstring& sql) const
+    {
+        auto stmt = PrepareStmt(sql);
+        int rc = sqlite3_step(stmt.get());
+        if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            std::ostringstream oss;
+            const char* err = sqlite3_errmsg(db_);
+            oss << "sqlite3_step failed: " << (err ? err : "(null)");
+            throw std::runtime_error(oss.str());
+        }
+        // stmt finalized by RAII
+    }
+
+    void InitSchema()
+    {
+        // Execute each statement separately (do NOT pass multiple statements to one prepare).
+        // Use INTEGER PRIMARY KEY (no AUTOINCREMENT).
+        const std::vector<std::wstring> statements = {
+            // Enable foreign keys once schema is created (also enabled after open).
+            // Create entries
+            LR"(
+                CREATE TABLE IF NOT EXISTS entries (
+                    id   INTEGER PRIMARY KEY,
+                    code TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    uses INTEGER NOT NULL DEFAULT 0
+                );
+            )",
+            // Create keys with UNIQUE constraint on 'key'
+            LR"(
+                CREATE TABLE IF NOT EXISTS keys (
+                    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+                    key      TEXT NOT NULL UNIQUE
+                );
+            )",
+            // Index on uses (ascending). SQLite can use it for ORDER BY; DESC index is not required.
+            LR"( CREATE INDEX IF NOT EXISTS idx_entries_uses ON entries(uses); )",
+            LR"( CREATE INDEX IF NOT EXISTS idx_keys_key ON keys(key); )"
+        };
+
+        for (const auto& s : statements) {
+            ExecSimple(s);
+        }
+    }
+
+    // Throw helper that includes sqlite3_errmsg(db_)
+    [[noreturn]] void ThrowSqliteError(const char* prefix) const
+    {
+        std::ostringstream oss;
+        const char* err = sqlite3_errmsg(db_);
+        oss << prefix << ": " << (err ? err : "(null)");
+        throw std::runtime_error(oss.str());
     }
 
 public:
+    CharacterDatabase()
+    {
+        // Open persistent DB file (UTF-16)
+        int rc = sqlite3_open16(L"characters.db", &db_);
+        if (rc != SQLITE_OK) {
+            const char* err = db_ ? sqlite3_errmsg(db_) : "sqlite_open failed";
+            if (db_) sqlite3_close(db_);
+            db_ = nullptr;
+            std::ostringstream oss;
+            oss << "sqlite3_open16 failed: " << (err ? err : "(null)");
+            throw std::runtime_error(oss.str());
+        }
+
+        // Enable foreign keys
+        try {
+            ExecSimple(L"PRAGMA foreign_keys = ON;");
+        } catch (...) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+            throw;
+        }
+
+        // Initialize schema (each statement executed individually)
+        InitSchema();
+    }
+
+    ~CharacterDatabase()
+    {
+        if (db_) sqlite3_close(db_);
+    }
+
+    // Seed database from a fixed list. Avoid duplicating entries on subsequent runs.
+    // Each entry gets inserted only if there isn't an existing entries row with the same code+text.
     void Seed()
     {
-        // Expanded list including mathematical symbols.
-        m_entries = {
+        if (!db_) ThrowSqliteError("database not opened");
+
+        // Begin transaction
+        ExecSimple(L"BEGIN TRANSACTION;");
+
+        // Prepared statements used during seeding.
+        auto stmtSelect = PrepareStmt(L"SELECT id FROM entries WHERE code = ? AND text = ? LIMIT 1;");
+        auto stmtInsertEntry = PrepareStmt(L"INSERT INTO entries (code, text, uses) VALUES (?, ?, ?);");
+        auto stmtInsertKey = PrepareStmt(L"INSERT OR IGNORE INTO keys (entry_id, key) VALUES (?, ?);");
+
+        auto select_id = [&](const Entry& e) -> std::optional<sqlite3_int64> {
+            sqlite3_reset(stmtSelect.get());
+            sqlite3_clear_bindings(stmtSelect.get());
+            sqlite3_bind_text16(stmtSelect.get(), 1, e.code.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text16(stmtSelect.get(), 2, e.text.c_str(), -1, SQLITE_TRANSIENT);
+            int rc = sqlite3_step(stmtSelect.get());
+            if (rc == SQLITE_ROW) {
+                sqlite3_int64 id = sqlite3_column_int64(stmtSelect.get(), 0);
+                return id;
+            } else if (rc == SQLITE_DONE) {
+                return std::nullopt;
+            } else {
+                ThrowSqliteError("Seed: select id failed");
+            }
+        };
+
+        auto insert_entry_and_keys = [&](const Entry& e) {
+            // Insert entry
+            sqlite3_reset(stmtInsertEntry.get());
+            sqlite3_clear_bindings(stmtInsertEntry.get());
+            sqlite3_bind_text16(stmtInsertEntry.get(), 1, e.code.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text16(stmtInsertEntry.get(), 2, e.text.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmtInsertEntry.get(), 3, static_cast<sqlite3_int64>(e.uses));
+            int rc = sqlite3_step(stmtInsertEntry.get());
+            if (rc != SQLITE_DONE) {
+                ThrowSqliteError("Seed: insert entry failed");
+            }
+            sqlite3_int64 entry_id = sqlite3_last_insert_rowid(db_);
+
+            // Insert keys (code and text) - use INSERT OR IGNORE to avoid duplicate key errors on re-seed
+            sqlite3_reset(stmtInsertKey.get());
+            sqlite3_clear_bindings(stmtInsertKey.get());
+            sqlite3_bind_int64(stmtInsertKey.get(), 1, entry_id);
+            sqlite3_bind_text16(stmtInsertKey.get(), 2, e.code.c_str(), -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmtInsertKey.get());
+            if (rc != SQLITE_DONE) {
+                ThrowSqliteError("Seed: insert key (code) failed");
+            }
+
+            sqlite3_reset(stmtInsertKey.get());
+            sqlite3_clear_bindings(stmtInsertKey.get());
+            sqlite3_bind_int64(stmtInsertKey.get(), 1, entry_id);
+            sqlite3_bind_text16(stmtInsertKey.get(), 2, e.text.c_str(), -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(stmtInsertKey.get());
+            if (rc != SQLITE_DONE) {
+                ThrowSqliteError("Seed: insert key (text) failed");
+            }
+        };
+
+        // Full seed list (identical to the previous hard-coded list).
+        // Kept in-place here to ensure header is self-contained.
+        std::vector<Entry> seeds = {
             // General
             {L"Theta",              L"Θ", 42},
             {L"Long dash",          L"—", 31},
@@ -93,7 +274,7 @@ public:
             {L"Does not contain",   L"∌", 5},
             {L"Subset",             L"⊂", 9},
             {L"Subset or equal",    L"⊆", 9},
-            {L"Superset",            L"⊃", 8},
+            {L"Superset",           L"⊃", 8},
             {L"Superset or equal",  L"⊇", 8},
             {L"Not subset",         L"⊄", 4},
             {L"Not subset or equal",L"⊈", 4},
@@ -130,8 +311,8 @@ public:
             {L"Composition",         L"∘", 6},
             {L"Maps to",             L"↦", 8},
             {L"Injection",           L"↪", 5},
-            {L"Surjection",           L"↠", 5},
-            {L"Embedding",            L"↬", 3},
+            {L"Surjection",          L"↠", 5},
+            {L"Embedding",           L"↬", 3},
             {L"Function arrow",      L"→", 8},
             {L"Bidirectional map",   L"↔", 7},
             {L"Long right arrow",    L"⟶", 5},
@@ -144,11 +325,11 @@ public:
             {L"Gamma",               L"γ", 10},
             {L"Delta",               L"δ", 10},
             {L"Epsilon",             L"ε", 9},
-            {L"Varepsilon",           L"ϵ", 7},
+            {L"Varepsilon",          L"ϵ", 7},
             {L"Zeta",                L"ζ", 7},
             {L"Eta",                 L"η", 7},
             {L"Theta",               L"θ", 12},
-            {L"Vartheta",             L"ϑ", 7},
+            {L"Vartheta",            L"ϑ", 7},
             {L"Iota",                L"ι", 7},
             {L"Kappa",               L"κ", 7},
             {L"Lambda",              L"λ", 10},
@@ -159,11 +340,11 @@ public:
             {L"Pi",                  L"π", 12},
             {L"Rho",                 L"ρ", 7},
             {L"Sigma",               L"σ", 10},
-            {L"Final sigma",          L"ς", 5},
+            {L"Final sigma",         L"ς", 5},
             {L"Tau",                 L"τ", 7},
             {L"Upsilon",             L"υ", 7},
             {L"Phi",                 L"φ", 10},
-            {L"Varphi",               L"ϕ", 7},
+            {L"Varphi",              L"ϕ", 7},
             {L"Chi",                 L"χ", 7},
             {L"Psi",                 L"ψ", 8},
             {L"Omega",               L"ω", 10},
@@ -310,7 +491,7 @@ public:
             {L"Lira",                L"₺", 6},
             {L"Hryvnia",             L"₴", 5},
             {L"Baht",                L"฿", 5},
-            {L"Bitcoin",              L"₿", 7},
+            {L"Bitcoin",             L"₿", 7},
             {L"Cent",                L"¢", 7},
             {L"Franc",               L"₣", 3},
             {L"Peso",                L"₱", 6},
@@ -321,108 +502,208 @@ public:
             // Miscellaneous mathematical / technical
             {L"Prime",               L"′", 6},
             {L"Double prime",        L"″", 5},
-            {L"Triple prime",         L"‴", 4},
-            {L"Per mille",            L"‰", 7},
-            {L"Per ten thousand",     L"‱", 3},
-            {L"Micro",                L"µ", 5},
-            {L"Section",              L"§", 7},
-            {L"Paragraph",            L"¶", 7},
-            {L"Number sign",          L"№", 5},
-            {L"Temperature",          L"℃", 5},
-            {L"Fahrenheit",           L"℉", 5},
-            {L"Angstrom",             L"Å", 5},
-            {L"Planck constant",      L"ℏ", 4},
-            {L"Euler number",         L"ℯ", 4},
-            {L"Imaginary unit",       L"ℑ", 4},
-            {L"Real part",             L"ℜ", 4},
-            {L"Blackboard R",         L"ℝ", 5},
-            {L"Blackboard N",         L"ℕ", 5},
-            {L"Blackboard Z",         L"ℤ", 5},
-            {L"Blackboard Q",         L"ℚ", 5},
-            {L"Blackboard C",         L"ℂ", 5},
+            {L"Triple prime",        L"‴", 4},
+            {L"Per mille",           L"‰", 7},
+            {L"Per ten thousand",    L"‱", 3},
+            {L"Micro",               L"µ", 5},
+            {L"Section",             L"§", 7},
+            {L"Paragraph",           L"¶", 7},
+            {L"Number sign",         L"№", 5},
+            {L"Temperature",         L"℃", 5},
+            {L"Fahrenheit",          L"℉", 5},
+            {L"Angstrom",            L"Å", 5},
+            {L"Planck constant",     L"ℏ", 4},
+            {L"Euler number",        L"ℯ", 4},
+            {L"Imaginary unit",      L"ℑ", 4},
+            {L"Real part",           L"ℜ", 4},
+            {L"Blackboard R",        L"ℝ", 5},
+            {L"Blackboard N",        L"ℕ", 5},
+            {L"Blackboard Z",        L"ℤ", 5},
+            {L"Blackboard Q",        L"ℚ", 5},
+            {L"Blackboard C",        L"ℂ", 5},
 
             // Geometric symbols
-            { L"Triangle",             L"△", 6 },
-            {L"White triangle",       L"▷", 4},
-            {L"Black triangle",       L"▶", 4},
-            {L"White circle",         L"○", 5},
-            {L"Black circle",         L"●", 5},
-            {L"White square",         L"□", 5},
-            {L"Black square",         L"■", 5},
-            {L"Diamond",              L"◇", 5},
-            {L"Black diamond",        L"◆", 5},
-            {L"Star",                 L"★", 5},
-            {L"White star",           L"☆", 4},
-            {L"Middle dot",           L"·", 7},
-            {L"Multiplication cross", L"✕", 5},
-            {L"Heavy check",          L"✔", 5},
-            {L"Heavy cross",          L"✖", 5},
+            {L"Triangle",            L"△", 6},
+            {L"White triangle",      L"▷", 4},
+            {L"Black triangle",      L"▶", 4},
+            {L"White circle",        L"○", 5},
+            {L"Black circle",        L"●", 5},
+            {L"White square",        L"□", 5},
+            {L"Black square",        L"■", 5},
+            {L"Diamond",             L"◇", 5},
+            {L"Black diamond",       L"◆", 5},
+            {L"Star",                L"★", 5},
+            {L"White star",          L"☆", 4},
+            {L"Middle dot",          L"·", 7},
+            {L"Multiplication cross",L"✕", 5},
+            {L"Heavy check",         L"✔", 5},
+            {L"Heavy cross",         L"✖", 5},
 
             // Punctuation / typography
-            {L"Ellipsis",             L"…", 10},
-            {L"Horizontal ellipsis",  L"⋯", 5},
-            {L"Vertical ellipsis",    L"⋮", 4},
-            {L"Midline ellipsis",     L"⋰", 3},
-            {L"Em dash",              L"—", 10},
-            {L"En dash",              L"–", 9},
-            {L"Figure dash",          L"‒", 4},
-            {L"Minus sign",           L"−", 10},
-            {L"Non-breaking hyphen",  L"-", 4},
-            {L"Bullet",               L"•", 8},
-            {L"Quotation mark left",  L"“", 6},
-            {L"Quotation mark right", L"”", 6},
-            {L"Single quote left",    L"‘", 5},
-            {L"Single quote right",   L"’", 5},
-            {L"Guillemets left",      L"«", 5},
-            {L"Guillemets right",     L"»", 5},
+            {L"Ellipsis",            L"…", 10},
+            {L"Horizontal ellipsis", L"⋯", 5},
+            {L"Vertical ellipsis",   L"⋮", 4},
+            {L"Midline ellipsis",    L"⋰", 3},
+            {L"Em dash",             L"—", 10},
+            {L"En dash",             L"–", 9},
+            {L"Figure dash",         L"‒", 4},
+            {L"Minus sign",          L"−", 10},
+            {L"Non-breaking hyphen", L"-", 4},
+            {L"Bullet",              L"•", 8},
+            {L"Quotation mark left", L"“", 6},
+            {L"Quotation mark right",L"”", 6},
+            {L"Single quote left",   L"‘", 5},
+            {L"Single quote right",  L"’", 5},
+            {L"Guillemets left",     L"«", 5},
+            {L"Guillemets right",    L"»", 5},
         };
-        Sort();
+
+        // For each seed, check if entry exists (same code+text). If not, insert entry and keys.
+        for (const auto& e : seeds) {
+            auto existing = select_id(e);
+            if (!existing.has_value()) {
+                insert_entry_and_keys(e);
+            }
+        }
+
+        // Commit transaction
+        ExecSimple(L"COMMIT;");
     }
 
-    const std::vector<Entry>& Sorted() const noexcept { return m_entries; }
-
-    // Return a filtered copy of entries matching the query (case-insensitive)
-    std::vector<Entry> Filtered(const std::wstring& query) const
+    // Return a sorted list of entries ordered by uses descending.
+    std::vector<Entry> Sorted() const
     {
-        if (query.empty()) return m_entries;
-        const auto q = ToLower(query);
         std::vector<Entry> out;
-        out.reserve(m_entries.size());
-        for (const auto& e : m_entries) {
-            const std::wstring codeLower = ToLower(e.code);
-            const std::wstring textLower = ToLower(e.text);
-            if (codeLower.find(q) != std::wstring::npos ||
-                textLower.find(q) != std::wstring::npos) {
-                out.push_back(e);
-            }
+        const std::wstring sql = LR"(
+            SELECT code, text, uses FROM entries
+            ORDER BY uses DESC, id ASC;
+        )";
+        auto stmt = PrepareStmt(sql);
+        int rc;
+        while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+            const wchar_t* code = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 0));
+            const wchar_t* text = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 1));
+            sqlite3_int64 uses = sqlite3_column_int64(stmt.get(), 2);
+            out.push_back({ std::wstring(code ? code : L""), std::wstring(text ? text : L""), static_cast<uint64_t>(uses) });
+        }
+        if (rc != SQLITE_DONE) {
+            ThrowSqliteError("Sorted: sqlite3_step failed");
         }
         return out;
     }
 
-    // Increment usage by friendly code name, then re-sort.
+    // Return a filtered copy of entries matching the query (case-insensitive)
+    std::vector<Entry> Filtered(const std::wstring& query) const
+    {
+        if (query.empty()) return Sorted();
+
+        const std::wstring pattern = L"%" + query + L"%";
+
+        const std::wstring sql = LR"(
+            SELECT DISTINCT e.code, e.text, e.uses
+            FROM entries e
+            LEFT JOIN keys k ON k.entry_id = e.id
+            WHERE e.code LIKE ? COLLATE NOCASE
+               OR e.text LIKE ? COLLATE NOCASE
+               OR k.key LIKE ? COLLATE NOCASE
+            ORDER BY e.uses DESC, e.id ASC;
+        )";
+
+        auto stmt = PrepareStmt(sql);
+        sqlite3_bind_text16(stmt.get(), 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text16(stmt.get(), 2, pattern.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text16(stmt.get(), 3, pattern.c_str(), -1, SQLITE_TRANSIENT);
+
+        std::vector<Entry> out;
+        int rc;
+        while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
+            const wchar_t* code = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 0));
+            const wchar_t* text = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 1));
+            sqlite3_int64 uses = sqlite3_column_int64(stmt.get(), 2);
+            out.push_back({ std::wstring(code ? code : L""), std::wstring(text ? text : L""), static_cast<uint64_t>(uses) });
+        }
+        if (rc != SQLITE_DONE) {
+            ThrowSqliteError("Filtered: sqlite3_step failed");
+        }
+        return out;
+    }
+
+    // Atomic lookup by key via keys table: increment uses and return the entry with uses BEFORE increment.
+    // Returns std::nullopt if no matching key found.
+    std::optional<Entry> Get(const std::wstring& key)
+    {
+        // UPDATE ... RETURNING to increment uses and return previous uses via uses - 1 AS uses
+        const std::wstring sql = LR"(
+            UPDATE entries
+            SET uses = uses + 1
+            WHERE id = (
+                SELECT entry_id FROM keys WHERE key = ? COLLATE NOCASE LIMIT 1
+            )
+            RETURNING code, text, uses - 1 AS uses;
+        )";
+
+        auto stmt = PrepareStmt(sql);
+        sqlite3_bind_text16(stmt.get(), 1, key.c_str(), -1, SQLITE_TRANSIENT);
+
+        int rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_ROW) {
+            const wchar_t* code = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 0));
+            const wchar_t* text = reinterpret_cast<const wchar_t*>(sqlite3_column_text16(stmt.get(), 1));
+            sqlite3_int64 uses_before = sqlite3_column_int64(stmt.get(), 2);
+            return Entry{ std::wstring(code ? code : L""), std::wstring(text ? text : L""), static_cast<uint64_t>(uses_before) };
+        } else if (rc == SQLITE_DONE) {
+            // No matching key -> no row returned
+            return std::nullopt;
+        } else {
+            ThrowSqliteError("Get: sqlite3_step failed");
+        }
+    }
+
+    // Increment usage by friendly code name using UPDATE ... RETURNING (no prior SELECT).
+    // If no row matches, nothing happens.
     void UseByCode(const std::wstring& code)
     {
-        auto it = std::find_if(m_entries.begin(), m_entries.end(),
-            [&](const Entry& e) { return e.code == code; });
-        if (it == m_entries.end()) return;
-        ++it->uses;
-        Sort();
+        const std::wstring sql = LR"(
+            UPDATE entries
+            SET uses = uses + 1
+            WHERE code = ? COLLATE NOCASE
+            RETURNING id;
+        )";
+        auto stmt = PrepareStmt(sql);
+        sqlite3_bind_text16(stmt.get(), 1, code.c_str(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_ROW) {
+            // updated; id returned. nothing else to do
+            (void)sqlite3_column_int64(stmt.get(), 0);
+        } else if (rc == SQLITE_DONE) {
+            // no row matched; nothing to do
+        } else {
+            ThrowSqliteError("UseByCode: sqlite3_step failed");
+        }
     }
 
-    // legacy: increment by index in the underlying storage
+    // Increment by index in sorted order (index into Sorted() view) using UPDATE with subquery.
     void Use(size_t i)
     {
-        if (i >= m_entries.size()) return;
-        ++m_entries[i].uses;
-        Sort();
-    }
-
-private:
-    void Sort()
-    {
-        std::stable_sort(m_entries.begin(), m_entries.end(),
-            [](const Entry& a, const Entry& b) {
-                return a.uses > b.uses;
-            });
+        const std::wstring sql = LR"(
+            UPDATE entries
+            SET uses = uses + 1
+            WHERE id = (
+                SELECT id FROM entries
+                ORDER BY uses DESC, id ASC
+                LIMIT 1 OFFSET ?
+            )
+            RETURNING id;
+        )";
+        auto stmt = PrepareStmt(sql);
+        sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(i));
+        int rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_ROW) {
+            (void)sqlite3_column_int64(stmt.get(), 0);
+        } else if (rc == SQLITE_DONE) {
+            // offset out of range -> nothing updated
+        } else {
+            ThrowSqliteError("Use: sqlite3_step failed");
+        }
     }
 };
