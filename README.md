@@ -1,48 +1,47 @@
 # UnicodeOverlay
 
-A small C++20 / Win32 / Direct3D 12 prototype for keyboard-driven Unicode/symbol insertion.
+A lightweight character selection overlay backed by a small SQLite database. The project provides a searchable, multikey character database and a D3D12 overlay for quick insertion of unicode characters.
 
-## Build
+Features
+- Persistent SQLite-backed character store (`characters.db`).
+- Multikey lookup via a `keys` table (both friendly `code` and the `text` glyph are usable keys).
+- Atomic lookups that increment usage via `UPDATE ... RETURNING`.
+- Seedable built-in character list (no duplicates on re-seed).
+- Uses UTF-16 SQLite API (`sqlite3_open16`) so `std::wstring` is used end-to-end.
 
-Requirements:
-- Visual Studio 2022 with Desktop development with C++
-- Windows 10/11 SDK
-- x64
-- No third-party libraries
+Quick usage
+- Open the overlay and:
+  - Press Numpad Enter to confirm / close with the numpad.
+  - Use arrow keys to navigate the list.
+  - Type to filter (search).
+  - Press Esc to close.
+  - Press standard Enter to insert the highlighted character into the target.
+- Searching matches `code`, `text`, and additional keys (case-insensitive).
 
-Open `UnicodeOverlay.sln`, select `Release | x64`, and Build.
+Installation (Windows 10 x64, Visual Studio)
+1. Install `sqlite3` with vcpkg (recommended):
+   - `vcpkg install sqlite3:x64-windows`
+   - Integrate with Visual Studio: run __vcpkg integrate install__ so projects pick up vcpkg libraries automatically.
+2. Open the solution in Visual Studio 2022.
+3. Ensure the project platform is `x64` and the C++ standard is set to C++20:
+   - __Project Properties > Configuration Properties > C/C++ > Language > C++ Language Standard__
+4. Build. Alternatively, manual linkage of `sqlite3.lib` is possible if you prefer not to use vcpkg.
 
-## Prototype controls
+Database details
+- DB file: `characters.db` (created in the working directory by the app).
+- Tables: `entries (id, code, text, uses)` and `keys (entry_id, key)`.
+- `keys.key` is UNIQUE; seeding uses `INSERT OR IGNORE` to avoid duplicate key errors.
+- `CharacterDatabase::Seed()` is available to populate the DB programmatically; it checks for existing `code+text` pairs before inserting.
 
-Default activation key: **Left Alt**.
+Editing the database
+- Edit `characters.db` with your preferred SQLite client. I personally use HeidiSQL. DB Browser for SQLite is also a good lightweight alternative.
 
-While holding Left Alt:
-- `1`..`9`: select one of the nine displayed entries.
-- Up/Down: move selection.
-- Enter: commit immediately.
-- Escape: cancel.
-- Other keyboard input is intercepted and not passed to the foreground application.
+Development notes
+- See `src\CharacterDatabase.h` for the database API and behavior.
+- The project uses UTF-16 SQLite functions and prepared statements with RAII finalization.
 
-On activation, the current foreground HWND is saved. The overlay is `WS_EX_NOACTIVATE`, so it does not take focus. On commit, Unicode is injected with `SendInput`; then the overlay is hidden and the saved foreground window is restored when possible.
+Contributing
+- Fork, make changes, open a PR. Keep changes small and focused.
 
-The database is initialized with Stop → Θ, Long pause → —, TM → ™. Edit `CharacterDatabase::Seed()` in `src/main.cpp` to add entries.
-
-## Important security/UIPI limitation
-
-`SendInput` is subject to Windows User Interface Privilege Isolation (UIPI). A non-elevated process cannot inject input into a higher-integrity target. The application deliberately remains `asInvoker` and does not request administrator rights. If the target is elevated, injection can fail; the overlay reports this briefly instead of pretending the insertion succeeded.
-
-A global `WH_KEYBOARD_LL` hook is used. The hook callback does only constant-time state checks and posts small messages to the UI thread. It does not perform rendering, allocation, or expensive work. Windows requires the hook thread to pump a message loop.
-
-## Rendering
-
-The overlay uses a minimal D3D12 swap chain and a single shader-based quad. Rendering is event driven: activation, selection, database updates, and DPI changes invalidate the overlay. There is no render loop and no polling timer. The swap chain is presented only after an explicit render request.
-
-For maximum simplicity, the prototype draws table rows as geometry with a solid background and uses a tiny GDI text layer for glyphs. This keeps the D3D12 requirement explicit while avoiding a full text shaping stack. For production-grade complex-script typography, DirectWrite would be the next Windows-only extension.
-
-## Files
-
-- `src/main.cpp` — complete prototype
-- `UnicodeOverlay.vcxproj` — VS project
-- `UnicodeOverlay.sln` — solution
-- `app.manifest` — PerMonitorV2 DPI
-- `app.rc` — manifest resource
+License
+- Check the repository root for licensing information.
